@@ -1,0 +1,34 @@
+{
+  "name": "airlock-electron-mcp",
+  "version": "0.1.0",
+  "description": "Airlock MCP stdio server for automating Electron apps with Playwright",
+  "type": "module",
+  "bin": {
+    "airlock-electron-mcp": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli.ts serve",
+    "start": "node dist/cli.js serve",
+    "test": "vitest run",
+    "lint": "tsc --noEmit --pretty false",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "format": "prettier --write 'src/**/*.ts'",
+    "format:check": "prettier --check 'src/**/*.ts'"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.5",
+    "zod": "^3.25.76"
+  },
+  "peerDependencies": {
+    "playwright": "^1.58.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "lefthook": "latest",
+    "prettier": "latest",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}
