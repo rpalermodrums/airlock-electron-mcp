@@ -1,0 +1,58 @@
+# Agents Log
+
+## Session: 2026-02-07 — Airlock V1 Phase 0+1 Build
+
+Goal: Build the Airlock Electron MCP server — Phase 0 (scaffolding) + Phase 1 (POC)
+Specs: docs/airlock-technical.md, docs/airlock-roadmap-1.md
+
+### Wave 1: Foundation (parallel)
+
+#### Spawned: 4d60289c - Scaffolding
+Type: implementation
+Status: COMPLETE
+Files: package.json, tsconfig.json, .gitignore, full src/ directory structure, cli.ts, artifacts/index.ts, logger, driver stubs
+
+#### Spawned: 32d76f60 - Types & Schemas
+Type: implementation
+Status: COMPLETE
+Files: types/session.ts, types/errors.ts, types/policy.ts, types/schemas.ts, types/index.ts
+
+#### Spawned: 9550b6f9 - MCP Server Core
+Type: implementation
+Status: COMPLETE
+Files: server.ts (549 lines), session-manager.ts, cli.ts, tools/capabilities.ts, tools/doctor.ts, tools/server-status.ts, tools/index.ts, driver/playwright.ts (stub), utils/event-log.ts
+
+### Wave 1 Review
+
+Audit found 7 issues:
+1. No branded types for SessionId/WindowId/RefId (plain strings)
+2. SnapshotNode missing locatorHints (Phase 2/3 correction not absorbed)
+3. Session missing traceState (Phase 2/3 correction not absorbed)
+4. ToolResult<T> defined in server.ts not types/ (architectural coupling)
+5. Stale schemas in types/schemas.ts diverged from actual tool implementations
+6. Duplicate toTimestampMs helper
+7. Missing process import in capabilities.ts
+
+### Fix-up Agent
+
+#### Spawned: a4452592 - Wave 1 Fixes
+Type: implementation
+Status: RUNNING
+Prompt: All 7 fixes above — branded types, locatorHints, traceState, ToolResult move, schema reconciliation, toTimestampMs extraction, process import
+
+### Wave 2: Core Automation (parallel)
+
+#### Spawned: 255dc9d4 - Launch + Playwright Driver
+Type: implementation
+Status: RUNNING
+Prompt: Full Playwright driver (launch/attach/getWindows/getSnapshot/performAction/screenshot/close), electron-vite preset, launch orchestration with fallback chain, app_launch/app_close/window_list tools
+
+#### Spawned: 03e13190 - Snapshot Engine
+Type: implementation
+Status: RUNNING
+Prompt: buildSnapshot/buildViewportSnapshot/buildQuerySnapshot, ref mapping (RefMap with epoch tracking), token budget enforcement, snapshot_interactive/snapshot_viewport/snapshot_query tools
+
+#### Spawned: b668e2f3 - Actions + Observability
+Type: implementation
+Status: RUNNING
+Prompt: Action execution engine (resolveTarget, executeAction), click/type/press_key tools, screenshot tool, console_recent tool, wait_for_idle/wait_for_visible/wait_for_text tools
