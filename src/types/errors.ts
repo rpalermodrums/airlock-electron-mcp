@@ -20,26 +20,30 @@ export interface AirlockError {
   message: string;
   retriable: boolean;
   details?: Record<string, unknown>;
+  requiresConfirmation?: boolean;
+  confirmationId?: string;
+}
+
+export interface AirlockErrorOptions {
+  requiresConfirmation?: boolean;
+  confirmationId?: string;
 }
 
 export const createAirlockError = (
   code: AirlockErrorCode,
   message: string,
   retriable: boolean = false,
-  details?: Record<string, unknown>
+  details?: Record<string, unknown>,
+  options: AirlockErrorOptions = {}
 ): AirlockError => {
   const baseError: AirlockError = {
     code,
     message,
-    retriable
+    retriable,
+    ...(details === undefined ? {} : { details }),
+    ...(options.requiresConfirmation === undefined ? {} : { requiresConfirmation: options.requiresConfirmation }),
+    ...(options.confirmationId === undefined ? {} : { confirmationId: options.confirmationId })
   };
-
-  if (details) {
-    return {
-      ...baseError,
-      details
-    };
-  }
 
   return baseError;
 };

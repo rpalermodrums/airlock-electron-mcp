@@ -2,11 +2,18 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z, type AnyZodObject, type ZodTypeAny } from "zod";
 
+import {
+  ConfirmationStore,
+  createConfirmation,
+  shouldRequireConfirmation,
+  type PendingConfirmation
+} from "./confirmation/index.js";
 import type { ElectronDriver } from "./driver/index.js";
 import { SessionManager } from "./session-manager.js";
 import {
@@ -15,8 +22,8 @@ import {
   createAirlockError,
   type AirlockError,
   type AirlockErrorCode,
+  type ResolvedPolicy,
   type SafetyMode,
-  type SafetyPolicy,
   type ToolMeta,
   type ToolResult
 } from "./types/index.js";
@@ -65,7 +72,7 @@ export interface AirlockServerMetadata {
 
 export interface AirlockToolContext {
   mode: SafetyMode;
-  policy: SafetyPolicy;
+  policy: ResolvedPolicy;
   preset?: string;
   supportedPresets: readonly string[];
   limits: AirlockServerLimits;
@@ -73,6 +80,7 @@ export interface AirlockToolContext {
   startedAtMs: number;
   driver: ElectronDriver;
   sessions: SessionManager;
+  confirmationStore?: ConfirmationStore;
   eventLog: EventLog;
   logger: Logger;
   getEnabledTools: () => readonly string[];
@@ -95,7 +103,7 @@ export interface AirlockToolDefinition<TInputSchema extends AnyZodObject, TOutpu
 }
 
 export interface AirlockServerConfig {
-  policy: SafetyPolicy;
+  policy: ResolvedPolicy;
   preset?: string;
   supportedPresets: readonly string[];
   limits: AirlockServerLimits;
@@ -118,7 +126,17 @@ interface ToolErrorEnvelope {
   error: AirlockError;
 }
 
-type ToolEnvelope<TData> = ToolSuccessEnvelope<TData> | ToolErrorEnvelope;
+interface ToolConfirmationEnvelope {
+  [key: string]: unknown;
+  ok: false;
+  tool: string;
+  requiresConfirmation: true;
+  confirmationId: string;
+  description: string;
+  expiresAt: string;
+}
+
+type ToolEnvelope<TData> = ToolSuccessEnvelope<TData> | ToolErrorEnvelope | ToolConfirmationEnvelope;
 
 const readPackageVersion = async (packagePath: string): Promise<string | null> => {
   try {
@@ -169,11 +187,19 @@ const normalizeError = (error: unknown): AirlockError => {
   if (isRecord(error) && typeof error.code === "string" && typeof error.message === "string") {
     const candidateCode = error.code as AirlockErrorCode;
     const normalizedCode = ERROR_CODE_SET.has(candidateCode) ? candidateCode : "INTERNAL_ERROR";
+    const requiresConfirmation =
+      typeof error.requiresConfirmation === "boolean" ? error.requiresConfirmation : undefined;
+    const confirmationId =
+      typeof error.confirmationId === "string" && error.confirmationId.length > 0 ? error.confirmationId : undefined;
     return createAirlockError(
       normalizedCode,
       error.message,
       typeof error.retriable === "boolean" ? error.retriable : false,
-      isRecord(error.details) ? error.details : undefined
+      isRecord(error.details) ? error.details : undefined,
+      {
+        ...(requiresConfirmation === undefined ? {} : { requiresConfirmation }),
+        ...(confirmationId === undefined ? {} : { confirmationId })
+      }
     );
   }
 
@@ -206,6 +232,40 @@ const extractWindowId = (input: unknown): string | undefined => {
 
   const candidate = input.windowId;
   return typeof candidate === "string" && candidate.length > 0 ? candidate : undefined;
+};
+
+interface ConfirmationInput {
+  confirmationId?: string;
+  confirmed?: boolean;
+}
+
+const extractConfirmationInput = (input: unknown): ConfirmationInput => {
+  if (!isRecord(input)) {
+    return {};
+  }
+
+  const confirmationIdCandidate = input.confirmationId;
+  const confirmedCandidate = input.confirmed;
+
+  return {
+    ...(typeof confirmationIdCandidate === "string" && confirmationIdCandidate.length > 0
+      ? { confirmationId: confirmationIdCandidate }
+      : {}),
+    ...(typeof confirmedCandidate === "boolean" ? { confirmed: confirmedCandidate } : {})
+  };
+};
+
+const stripConfirmationFields = (input: unknown): unknown => {
+  if (!isRecord(input)) {
+    return input;
+  }
+
+  const { confirmationId: _confirmationId, confirmed: _confirmed, ...rest } = input;
+  return rest;
+};
+
+const toConfirmationDescription = (toolName: string): string => {
+  return `Tool "${toolName}" requires confirmation before execution.`;
 };
 
 const toMcpSuccess = <TData>(toolName: string, result: ToolResult<TData>) => {
@@ -245,6 +305,27 @@ const toMcpError = (toolName: string, error: AirlockError) => {
   };
 };
 
+const toMcpConfirmation = (toolName: string, confirmation: PendingConfirmation) => {
+  const envelope: ToolConfirmationEnvelope = {
+    ok: false,
+    tool: toolName,
+    requiresConfirmation: true,
+    confirmationId: confirmation.id,
+    description: confirmation.description,
+    expiresAt: new Date(confirmation.expiresAt).toISOString()
+  };
+
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: envelopeText(envelope)
+      }
+    ],
+    structuredContent: envelope
+  };
+};
+
 export const defineAirlockTool = <TInputSchema extends AnyZodObject, TOutputSchema extends ZodTypeAny>(
   definition: AirlockToolDefinition<TInputSchema, TOutputSchema>
 ): AirlockToolDefinition<TInputSchema, TOutputSchema> => {
@@ -255,8 +336,9 @@ export class AirlockServer {
   private readonly mcp: McpServer;
   private readonly logger: Logger;
   private readonly sessionManager: SessionManager;
+  private readonly confirmationStore: ConfirmationStore;
   private readonly eventLog: EventLog;
-  private readonly policy: SafetyPolicy;
+  private readonly policy: ResolvedPolicy;
   private readonly preset: string | undefined;
   private readonly supportedPresets: readonly string[];
   private readonly limits: AirlockServerLimits;
@@ -281,7 +363,9 @@ export class AirlockServer {
     this.sessionManager = new SessionManager({
       ttlMs: config.policy.maxSessionTtlMs
     });
+    this.confirmationStore = new ConfirmationStore();
     this.eventLog = new EventLog(config.eventLogMaxEntries);
+    this.eventLog.addRedactionPatterns(config.policy.redactionPatterns ?? []);
     this.mcp = new McpServer({
       name: this.metadata.name,
       version: this.metadata.version
@@ -348,6 +432,7 @@ export class AirlockServer {
   public getEnabledToolNames(): readonly string[] {
     return [...this.toolDefinitions.values()]
       .filter((definition) => this.isToolAllowedInMode(definition, this.policy.mode))
+      .filter((definition) => this.isToolEnabledByPolicy(definition.name))
       .map((definition) => definition.name)
       .sort((left, right) => left.localeCompare(right));
   }
@@ -372,6 +457,7 @@ export class AirlockServer {
 
         try {
           await this.cleanupStaleSessions();
+          this.confirmationStore.cleanup();
 
           if (!this.isToolAllowedInMode(definition, this.policy.mode)) {
             const modeError = createAirlockError(
@@ -391,7 +477,29 @@ export class AirlockServer {
             return toMcpError(definition.name, modeError);
           }
 
-          const parsedInput = definition.inputSchema.safeParse(rawInput);
+          if (this.isToolDisabledByPolicy(definition.name)) {
+            const policyError = createAirlockError(
+              "POLICY_VIOLATION",
+              `Tool "${definition.name}" is disabled by the active policy.`,
+              false,
+              {
+                tool: definition.name,
+                sourcePath: this.policy.sourcePath
+              }
+            );
+            this.recordToolEvent(definition.name, rawInput, inputSessionId, inputWindowId, startedAt, {
+              status: "error",
+              message: policyError.message,
+              errorCode: policyError.code
+            });
+            return toMcpError(definition.name, policyError);
+          }
+
+          const confirmationRequiredByPolicy = shouldRequireConfirmation(definition.name, this.policy);
+          const confirmationInput = extractConfirmationInput(rawInput);
+          const inputForValidation = definition.name === "confirm" ? rawInput : stripConfirmationFields(rawInput);
+
+          const parsedInput = definition.inputSchema.safeParse(inputForValidation);
           if (!parsedInput.success) {
             const inputError = createAirlockError("INVALID_INPUT", "Input validation failed.", false, {
               issues: parsedInput.error.issues.map((issue: z.ZodIssue) => ({
@@ -406,6 +514,94 @@ export class AirlockServer {
               errorCode: inputError.code
             });
             return toMcpError(definition.name, inputError);
+          }
+
+          if (confirmationRequiredByPolicy) {
+            const description = toConfirmationDescription(definition.name);
+            if (confirmationInput.confirmationId === undefined) {
+              const pendingConfirmation = createConfirmation(definition.name, description, parsedInput.data, {
+                ttlMs: this.confirmationStore.getTtlMs()
+              });
+              this.confirmationStore.add(pendingConfirmation);
+              this.recordToolEvent(definition.name, rawInput, inputSessionId, inputWindowId, startedAt, {
+                status: "error",
+                message: description,
+                errorCode: "POLICY_VIOLATION"
+              });
+              return toMcpConfirmation(definition.name, pendingConfirmation);
+            }
+
+            const pendingConfirmation = this.confirmationStore.get(confirmationInput.confirmationId);
+            if (pendingConfirmation === undefined) {
+              const confirmationError = createAirlockError(
+                "INVALID_INPUT",
+                `Confirmation "${confirmationInput.confirmationId}" was not found or has expired.`,
+                false,
+                {
+                  tool: definition.name,
+                  confirmationId: confirmationInput.confirmationId
+                }
+              );
+              this.recordToolEvent(definition.name, rawInput, inputSessionId, inputWindowId, startedAt, {
+                status: "error",
+                message: confirmationError.message,
+                errorCode: confirmationError.code
+              });
+              return toMcpError(definition.name, confirmationError);
+            }
+
+            if (pendingConfirmation.toolName !== definition.name) {
+              const mismatchError = createAirlockError(
+                "INVALID_INPUT",
+                `Confirmation "${confirmationInput.confirmationId}" is for "${pendingConfirmation.toolName}", not "${definition.name}".`,
+                false,
+                {
+                  tool: definition.name,
+                  confirmationId: confirmationInput.confirmationId,
+                  expectedTool: pendingConfirmation.toolName
+                }
+              );
+              this.recordToolEvent(definition.name, rawInput, inputSessionId, inputWindowId, startedAt, {
+                status: "error",
+                message: mismatchError.message,
+                errorCode: mismatchError.code
+              });
+              return toMcpError(definition.name, mismatchError);
+            }
+
+            if (!isDeepStrictEqual(parsedInput.data, pendingConfirmation.params)) {
+              const paramsMismatchError = createAirlockError(
+                "INVALID_INPUT",
+                `Confirmation "${confirmationInput.confirmationId}" does not match the provided parameters.`,
+                false,
+                {
+                  tool: definition.name,
+                  confirmationId: confirmationInput.confirmationId
+                }
+              );
+              this.recordToolEvent(definition.name, rawInput, inputSessionId, inputWindowId, startedAt, {
+                status: "error",
+                message: paramsMismatchError.message,
+                errorCode: paramsMismatchError.code
+              });
+              return toMcpError(definition.name, paramsMismatchError);
+            }
+
+            const isConfirmed = pendingConfirmation.confirmedAt !== undefined || confirmationInput.confirmed === true;
+            if (!isConfirmed) {
+              this.recordToolEvent(definition.name, rawInput, inputSessionId, inputWindowId, startedAt, {
+                status: "error",
+                message: pendingConfirmation.description,
+                errorCode: "POLICY_VIOLATION"
+              });
+              return toMcpConfirmation(definition.name, pendingConfirmation);
+            }
+
+            if (pendingConfirmation.confirmedAt === undefined && confirmationInput.confirmed === true) {
+              pendingConfirmation.confirmedAt = Date.now();
+            }
+
+            this.confirmationStore.consume(confirmationInput.confirmationId);
           }
 
           if (inputSessionId !== undefined) {
@@ -476,6 +672,7 @@ export class AirlockServer {
       startedAtMs: this.startedAtMs,
       driver: this.driver,
       sessions: this.sessionManager,
+      confirmationStore: this.confirmationStore,
       eventLog: this.eventLog,
       logger: this.logger,
       getEnabledTools: () => this.getEnabledToolNames()
@@ -498,6 +695,14 @@ export class AirlockServer {
     }
 
     return definition.allowedModes.includes(mode);
+  }
+
+  private isToolDisabledByPolicy(toolName: string): boolean {
+    return this.policy.tools?.disabled.includes(toolName) ?? false;
+  }
+
+  private isToolEnabledByPolicy(toolName: string): boolean {
+    return !this.isToolDisabledByPolicy(toolName);
   }
 
   private async cleanupStaleSessions(): Promise<void> {
