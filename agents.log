@@ -64,3 +64,90 @@ Prompt: Action execution engine (resolveTarget, executeAction), click/type/press
 - Total test files: 17
 - Total tests passing: 94
 - All checks status (typecheck, tests, lint): PASS
+
+---
+
+## Session: 2026-02-08 — Airlock V2 Implementation
+
+Goal: Implement V2 from docs/airlock-roadmap-2.md
+Baseline: 35 source files, 17 test files, 94 tests, zero type errors
+Specs: docs/airlock-roadmap-2.md, docs/airlock-v1-status.md, docs/v2-session-prompt.md
+
+### Wave 1: Foundation (parallel)
+
+#### Spawned: 93cf937b - Deferred V1 Tools
+Type: implementation
+Status: COMPLETE
+Scope: 7 new tools (app_kill, session_info, window_focus, select, hover, network_recent, server_reset)
+Files: src/tools/ (new tool files), src/tools/index.ts (additions), src/types/schemas.ts (additions), src/driver/index.ts (additions), src/driver/playwright.ts (additions)
+
+#### Spawned: 14894fea - Readiness Signals + Preset DSL
+Type: implementation
+Status: COMPLETE
+Scope: Composable readiness signal engine, preset DSL refactor, first-class CDP attach, launch diagnostics
+Files: src/launch/ (refactor + new modules: presets.ts, readiness.ts, diagnostics.ts)
+
+#### Spawned: d25f197f - Policy-as-Code Engine
+Type: implementation
+Status: COMPLETE
+Scope: YAML/JSON policy file loader, validation, merge with runtime defaults, redaction enhancement
+Files: src/policy/ (new directory), src/types/policy.ts (extensions), src/cli.ts (additions), src/server.ts (minimal), src/utils/event-log.ts (additions)
+
+### Wave 1 Review
+- Typecheck: PASS
+- Tests: 31 files, 138 tests (up from 17/94)
+- Source files: 49 (up from 35)
+- All 3 agents completed successfully
+
+### Wave 2: V2 Feature Tools (parallel)
+
+#### Spawned: 1eaa8071 - Snapshot Evolution
+Type: implementation
+Status: COMPLETE
+Scope: snapshot_diff, snapshot_region, scroll_to, cross-epoch ref re-resolution, query-first defaults
+Files: src/snapshot/, src/tools/snapshot.ts, src/tools/scroll-to.ts
+
+#### Spawned: 9190154b - Window Management
+Type: implementation
+Status: COMPLETE
+Scope: wait_for_window, window_default_get/set, enhanced implicit targeting, modal detection
+Files: src/tools/window-*, src/tools/wait-for-window.ts, src/tools/helpers.ts, src/session-manager.ts
+
+#### Spawned: 1bd952e0 - Observability
+Type: implementation
+Status: COMPLETE
+Scope: trace_start/stop, export_artifacts, crash/hang diagnostics
+Files: src/tools/trace.ts, src/tools/export-artifacts.ts, src/tools/crash-diagnostics.ts, src/driver/
+
+### Wave 2 Review
+- Typecheck: PASS
+- Tests: 37 files, 173 tests (up from 31/138)
+- Source files: 49+ new tools and modules
+- All 3 agents completed successfully
+
+### Wave 3: Polish + Remaining Features (parallel)
+
+#### Spawned: e53444c8 - Confirmation Gates
+Type: implementation
+Status: COMPLETE
+Scope: Confirmation gate protocol, store, confirm tool, server integration
+Files: src/confirmation/ (new), src/tools/confirm.ts, src/server.ts
+
+#### Spawned: 05e7214d - Launch Presets + Playbooks
+Type: implementation
+Status: COMPLETE
+Scope: Forge/electron-builder/attach presets, failure playbooks, doctor enhancement
+Files: src/launch/presets.ts, src/launch/playbooks.ts, src/tools/doctor.ts
+
+#### Spawned: ef2df6e5 - Test Coverage + Quality Review
+Type: testing/review
+Status: COMPLETE
+Scope: Audit all V2 code, fill test gaps, pattern consistency, fix minor issues
+Files: *.test.ts (all test files except confirmation/ and playbooks)
+
+### Wave 3 Review
+- Typecheck: PASS
+- Tests: 42 files, 228 tests (up from 37/173)
+- Source files: 59 (up from 49 after Wave 1)
+- All 3 agents completed successfully
+- Total lines: ~20,865
