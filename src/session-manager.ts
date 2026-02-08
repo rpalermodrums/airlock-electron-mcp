@@ -16,8 +16,12 @@ const toErrorDetails = (error: unknown): Record<string, unknown> => {
 export interface ManagedSession {
   session: Session;
   driverSession?: DriverSession;
+  defaultWindowId?: Session["selectedWindowId"];
+  lastInteractedWindowId?: Session["selectedWindowId"];
+  lastFocusedPrimaryWindowId?: Session["selectedWindowId"];
   refMaps?: Map<string, RefMap>;
   cleanup?: (managedSession: ManagedSession) => Promise<void>;
+  traceCleanupWrapped?: boolean;
 }
 
 export interface SessionManagerConfig {
@@ -117,6 +121,23 @@ export class SessionManager {
     const now = new Date().toISOString();
     managedSession.session.lastActivityAt = now;
     managedSession.session.updatedAt = now;
+  }
+
+  public setTraceState(sessionId: string, traceState: Session["traceState"]): void {
+    const managedSession = this.sessions.get(sessionId);
+    if (managedSession === undefined) {
+      return;
+    }
+
+    if (traceState === undefined) {
+      delete managedSession.session.traceState;
+    } else {
+      managedSession.session.traceState = traceState;
+    }
+
+    const now = new Date().toISOString();
+    managedSession.session.updatedAt = now;
+    managedSession.session.lastActivityAt = now;
   }
 
   public setRefMap(sessionId: string, windowId: string, refMap: RefMap): void {
