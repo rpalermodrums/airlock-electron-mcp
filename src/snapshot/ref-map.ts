@@ -1,4 +1,5 @@
-import type { RefId, SnapshotNode } from "../types/session.js";
+import { createAirlockError } from "../types/errors.js";
+import type { RefId, Snapshot, SnapshotNode } from "../types/session.js";
 
 export interface SelectorDescriptor {
   type: "testId" | "role" | "label" | "text" | "css";
@@ -18,6 +19,8 @@ const PRIORITY = {
   text: 70,
   css: 10
 } as const;
+
+const STALE_DESCRIPTOR_HISTORY_LIMIT = 5;
 
 const asRefId = (ref: string): RefId => {
   return ref as RefId;
@@ -89,19 +92,96 @@ const descriptorForNode = (node: SnapshotNode): SelectorDescriptor | undefined =
   return candidates.filter(isDefined).sort((left, right) => right.priority - left.priority)[0];
 };
 
+const descriptorMatchesNode = (descriptor: SelectorDescriptor, node: SnapshotNode): boolean => {
+  if (descriptor.type === "testId") {
+    return node.locatorHints?.testId === descriptor.value;
+  }
+
+  if (descriptor.type === "role") {
+    if (node.locatorHints?.roleAndName === undefined) {
+      return false;
+    }
+
+    const parsed = decodeRoleAndName(descriptor.value);
+    if (parsed === undefined) {
+      return false;
+    }
+
+    return node.locatorHints.roleAndName.role === parsed.role && node.locatorHints.roleAndName.name === parsed.name;
+  }
+
+  if (descriptor.type === "label") {
+    return node.locatorHints?.label === descriptor.value;
+  }
+
+  if (descriptor.type === "text") {
+    return node.locatorHints?.textContent === descriptor.value;
+  }
+
+  return false;
+};
+
+const descriptorsEqual = (left: SelectorDescriptor, right: SelectorDescriptor): boolean => {
+  return left.type === right.type && left.value === right.value && left.priority === right.priority;
+};
+
+const trimDescriptorHistory = (descriptors: readonly SelectorDescriptor[]): readonly SelectorDescriptor[] => {
+  return descriptors.slice(0, STALE_DESCRIPTOR_HISTORY_LIMIT);
+};
+
 export class RefMap {
   private descriptors = new Map<RefId, SelectorDescriptor>();
+  private staleDescriptorHistory = new Map<RefId, readonly SelectorDescriptor[]>();
+  private currentSnapshotNodes: readonly SnapshotNode[] = [];
   private epoch = 0;
+
+  private lookupDescriptor(ref: RefId): SelectorDescriptor | undefined {
+    const currentDescriptor = this.descriptors.get(ref);
+    if (currentDescriptor !== undefined) {
+      return currentDescriptor;
+    }
+
+    return this.staleDescriptorHistory.get(ref)?.[0];
+  }
 
   public get currentEpoch(): number {
     return this.epoch;
   }
 
   public resolveRef(ref: string): SelectorDescriptor | undefined {
-    return this.descriptors.get(asRefId(ref));
+    const normalizedRef = asRefId(ref);
+    const descriptor = this.lookupDescriptor(normalizedRef);
+    if (descriptor === undefined) {
+      return undefined;
+    }
+
+    if (this.descriptors.has(normalizedRef)) {
+      return descriptor;
+    }
+
+    if (this.currentSnapshotNodes.length === 0) {
+      return descriptor;
+    }
+
+    const resolvedRef = this.reResolveRef(normalizedRef, this.getCurrentSnapshot());
+    if (resolvedRef === null) {
+      return descriptor;
+    }
+
+    return this.descriptors.get(resolvedRef) ?? descriptor;
   }
 
   public rebuildFromSnapshot(nodes: readonly SnapshotNode[]): number {
+    for (const [ref, descriptor] of this.descriptors.entries()) {
+      const existingHistory = this.staleDescriptorHistory.get(ref) ?? [];
+      const firstHistoryDescriptor = existingHistory[0];
+      const nextHistory =
+        firstHistoryDescriptor !== undefined && descriptorsEqual(firstHistoryDescriptor, descriptor)
+          ? existingHistory
+          : trimDescriptorHistory([descriptor, ...existingHistory]);
+      this.staleDescriptorHistory.set(ref, nextHistory);
+    }
+
     const descriptors = nodes.reduce((accumulator, node) => {
       const descriptor = descriptorForNode(node);
       if (descriptor !== undefined) {
@@ -111,12 +191,57 @@ export class RefMap {
     }, new Map<RefId, SelectorDescriptor>());
 
     this.descriptors = descriptors;
+    this.currentSnapshotNodes = [...nodes];
     this.epoch += 1;
     return this.epoch;
   }
 
   public isStale(epoch: number): boolean {
     return epoch !== this.epoch;
+  }
+
+  public getCurrentSnapshot(): Snapshot {
+    return {
+      sessionId: "ref-map" as Snapshot["sessionId"],
+      windowId: "ref-map" as Snapshot["windowId"],
+      version: this.epoch,
+      createdAt: new Date(0).toISOString(),
+      truncated: false,
+      nodes: [...this.currentSnapshotNodes]
+    };
+  }
+
+  public reResolveRef(staleRef: RefId, currentSnapshot: Snapshot): RefId | null {
+    const staleDescriptor = this.lookupDescriptor(staleRef);
+    if (staleDescriptor === undefined) {
+      return null;
+    }
+
+    const matches = currentSnapshot.nodes.filter((node) => descriptorMatchesNode(staleDescriptor, node));
+
+    if (matches.length === 0) {
+      return null;
+    }
+
+    if (matches.length > 1) {
+      throw createAirlockError(
+        "REF_STALE",
+        `Stale ref "${staleRef}" matched multiple nodes during cross-epoch re-resolution.`,
+        false,
+        {
+          ref: staleRef,
+          descriptor: staleDescriptor,
+          matches: matches.map((node) => ({
+            ref: node.ref,
+            role: node.role,
+            name: node.name
+          }))
+        }
+      );
+    }
+
+    const resolvedRef = matches[0]?.ref;
+    return resolvedRef ?? null;
   }
 
   public toPlaywrightLocator(descriptor: SelectorDescriptor): string {

@@ -66,6 +66,32 @@ interface PreparedNode {
   hasTextTruncation: boolean;
 }
 
+type SnapshotComparableValue = string | number | boolean | null | undefined;
+
+export interface SnapshotDiffValueChange {
+  before?: SnapshotComparableValue;
+  after?: SnapshotComparableValue;
+}
+
+export interface SnapshotNodeDiffChanges {
+  name?: SnapshotDiffValueChange;
+  value?: SnapshotDiffValueChange;
+  checked?: SnapshotDiffValueChange;
+  disabled?: SnapshotDiffValueChange;
+}
+
+export interface SnapshotNodeDiffEntry {
+  ref: SnapshotNode["ref"];
+  changes: SnapshotNodeDiffChanges;
+}
+
+export interface SnapshotDiff {
+  added: SnapshotNode[];
+  removed: SnapshotNode[];
+  changed: SnapshotNodeDiffEntry[];
+  context: SnapshotNode[];
+}
+
 const isRecord = (value: unknown): value is Record<string, unknown> => {
   return typeof value === "object" && value !== null;
 };
@@ -430,6 +456,193 @@ const likelyInViewport = (entry: FlattenedNode, viewportRect: ViewportRect): boo
   return entry.depth <= 3;
 };
 
+const toNormalizedText = (value: string): string => {
+  return value.trim().toLowerCase();
+};
+
+const toNormalizedRoleNameKey = (role: string, name: string): string => {
+  return `role:${normalizeRole(role)}:${toNormalizedText(name)}`;
+};
+
+const identityKeysForSnapshotNode = (node: SnapshotNode): readonly string[] => {
+  const keys = [
+    node.locatorHints?.testId === undefined ? undefined : `testId:${toNormalizedText(node.locatorHints.testId)}`,
+    node.locatorHints?.roleAndName === undefined
+      ? undefined
+      : toNormalizedRoleNameKey(node.locatorHints.roleAndName.role, node.locatorHints.roleAndName.name),
+    node.locatorHints?.label === undefined ? undefined : `label:${toNormalizedText(node.locatorHints.label)}`,
+    node.locatorHints?.textContent === undefined
+      ? undefined
+      : `text:${toNormalizedText(node.locatorHints.textContent)}`,
+    toNormalizedRoleNameKey(node.role, node.name)
+  ].filter((value): value is string => value !== undefined && value.length > 0);
+
+  return Array.from(new Set(keys));
+};
+
+const buildChanges = (current: SnapshotNode, previous: SnapshotNode): SnapshotNodeDiffChanges => {
+  const valueChanged = !Object.is(current.value, previous.value);
+  const checkedChanged = !Object.is(current.checked, previous.checked);
+  const disabledChanged = !Object.is(current.disabled, previous.disabled);
+
+  return {
+    ...(current.name !== previous.name
+      ? {
+          name: {
+            before: previous.name,
+            after: current.name
+          }
+        }
+      : {}),
+    ...(valueChanged
+      ? {
+          value: {
+            before: previous.value,
+            after: current.value
+          }
+        }
+      : {}),
+    ...(checkedChanged
+      ? {
+          checked: {
+            before: previous.checked,
+            after: current.checked
+          }
+        }
+      : {}),
+    ...(disabledChanged
+      ? {
+          disabled: {
+            before: previous.disabled,
+            after: current.disabled
+          }
+        }
+      : {})
+  };
+};
+
+const hasAnyChanges = (changes: SnapshotNodeDiffChanges): boolean => {
+  return (
+    changes.name !== undefined ||
+    changes.value !== undefined ||
+    changes.checked !== undefined ||
+    changes.disabled !== undefined
+  );
+};
+
+const isNodeMatchByStrategy = (node: SnapshotNode, strategy: string, value: string): boolean => {
+  if (strategy === "testId") {
+    return node.locatorHints?.testId !== undefined && toNormalizedText(node.locatorHints.testId) === value;
+  }
+
+  if (strategy === "roleAndName") {
+    return (
+      node.locatorHints?.roleAndName !== undefined &&
+      toNormalizedRoleNameKey(node.locatorHints.roleAndName.role, node.locatorHints.roleAndName.name) === value
+    );
+  }
+
+  if (strategy === "label") {
+    return node.locatorHints?.label !== undefined && toNormalizedText(node.locatorHints.label) === value;
+  }
+
+  if (strategy === "text") {
+    return node.locatorHints?.textContent !== undefined && toNormalizedText(node.locatorHints.textContent) === value;
+  }
+
+  return toNormalizedRoleNameKey(node.role, node.name) === value;
+};
+
+const toRawNodeIdentityCandidates = (node: RawSnapshotNode): readonly { strategy: string; value: string }[] => {
+  const role = trimString(node.role);
+  const name = trimString(node.name) ?? trimString(node.text) ?? trimString(node.value);
+  const testId = readAttributeValue(node, ["data-testid", "testid", "test-id", "test_id"]);
+  const label = trimString(node.label) ?? readAttributeValue(node, ["aria-label", "label"]);
+  const text = trimString(node.text) ?? trimString(node.name) ?? trimString(node.value);
+
+  return [
+    ...(testId === undefined ? [] : [{ strategy: "testId", value: toNormalizedText(testId) }]),
+    ...(role === undefined || name === undefined
+      ? []
+      : [{ strategy: "roleAndName", value: toNormalizedRoleNameKey(role, name) }]),
+    ...(label === undefined ? [] : [{ strategy: "label", value: toNormalizedText(label) }]),
+    ...(text === undefined ? [] : [{ strategy: "text", value: toNormalizedText(text) }]),
+    ...(role === undefined || name === undefined
+      ? []
+      : [{ strategy: "roleName", value: toNormalizedRoleNameKey(role, name) }])
+  ];
+};
+
+const toSnapshotNodeIdentityCandidates = (node: SnapshotNode): readonly { strategy: string; value: string }[] => {
+  return [
+    ...(node.locatorHints?.testId === undefined
+      ? []
+      : [{ strategy: "testId", value: toNormalizedText(node.locatorHints.testId) }]),
+    ...(node.locatorHints?.roleAndName === undefined
+      ? []
+      : [
+          {
+            strategy: "roleAndName",
+            value: toNormalizedRoleNameKey(node.locatorHints.roleAndName.role, node.locatorHints.roleAndName.name)
+          }
+        ]),
+    ...(node.locatorHints?.label === undefined
+      ? []
+      : [{ strategy: "label", value: toNormalizedText(node.locatorHints.label) }]),
+    ...(node.locatorHints?.textContent === undefined
+      ? []
+      : [{ strategy: "text", value: toNormalizedText(node.locatorHints.textContent) }]),
+    {
+      strategy: "roleName",
+      value: toNormalizedRoleNameKey(node.role, node.name)
+    }
+  ];
+};
+
+const findRawNodeForSnapshotNode = (
+  rawSnapshot: RawSnapshot,
+  snapshotNode: SnapshotNode
+): FlattenedNode | undefined => {
+  const flattenedNodes = flattenNodes(rawSnapshot.nodes);
+  const snapshotCandidates = toSnapshotNodeIdentityCandidates(snapshotNode);
+
+  for (const candidate of snapshotCandidates) {
+    const matches = flattenedNodes.filter((entry) =>
+      toRawNodeIdentityCandidates(entry.node).some(
+        (rawIdentity) => rawIdentity.strategy === candidate.strategy && rawIdentity.value === candidate.value
+      )
+    );
+
+    if (matches.length === 1) {
+      return matches[0];
+    }
+
+    const withBounds = matches.filter((entry) => getNodeBounds(entry.node) !== undefined);
+    if (withBounds.length === 1) {
+      return withBounds[0];
+    }
+  }
+
+  return undefined;
+};
+
+const selectRegionNodeIds = (
+  flattenedNodes: readonly FlattenedNode[],
+  boundingRect: ViewportRect
+): ReadonlySet<string> => {
+  const selectedNodeIds = flattenedNodes
+    .filter((entry) => {
+      const bounds = getNodeBounds(entry.node);
+      return bounds !== undefined && hasIntersection(bounds, boundingRect);
+    })
+    .flatMap((entry) => {
+      const nearestAncestors = entry.ancestorIds.slice(-QUERY_ANCESTOR_DEPTH);
+      return [...nearestAncestors, entry.id];
+    });
+
+  return new Set(selectedNodeIds);
+};
+
 export const buildSnapshot = (rawSnapshot: RawSnapshot, options: SnapshotOptions): Snapshot => {
   const normalizedOptions = normalizeOptions(options);
   const flattenedNodes = flattenNodes(rawSnapshot.nodes);
@@ -458,4 +671,128 @@ export const buildQuerySnapshot = (
   const selectedNodeIds = queryContextNodeIds(flattenedNodes, query);
   const queryNodes = flattenedNodes.filter((entry) => selectedNodeIds.has(entry.id));
   return buildSnapshotFromNodes(rawSnapshot, queryNodes, normalizedOptions, "query");
+};
+
+export const buildRegionSnapshot = (
+  rawSnapshot: RawSnapshot,
+  boundingRect: ViewportRect,
+  options: SnapshotOptions
+): Snapshot => {
+  const normalizedOptions = normalizeOptions(options);
+  const flattenedNodes = flattenNodes(rawSnapshot.nodes);
+  const selectedNodeIds = selectRegionNodeIds(flattenedNodes, boundingRect);
+  const regionNodes = flattenedNodes.filter((entry) => selectedNodeIds.has(entry.id));
+  return buildSnapshotFromNodes(rawSnapshot, regionNodes, normalizedOptions, "region");
+};
+
+export const findSnapshotNodeBounds = (
+  rawSnapshot: RawSnapshot,
+  snapshotNode: SnapshotNode
+): RawSnapshotRect | undefined => {
+  const match = findRawNodeForSnapshotNode(rawSnapshot, snapshotNode);
+  if (match === undefined) {
+    return undefined;
+  }
+
+  return getNodeBounds(match.node);
+};
+
+export const buildSnapshotDiff = (current: Snapshot, previous: Snapshot): SnapshotDiff => {
+  const previousIndexesByIdentity = previous.nodes.reduce((accumulator, node, index) => {
+    for (const key of identityKeysForSnapshotNode(node)) {
+      const existing = accumulator.get(key);
+      if (existing === undefined) {
+        accumulator.set(key, [index]);
+      } else {
+        existing.push(index);
+      }
+    }
+
+    return accumulator;
+  }, new Map<string, number[]>());
+
+  const matchedPreviousIndexes = new Set<number>();
+  const matchedCurrentIndexes = new Set<number>();
+  const matchedPairs: Array<{ currentIndex: number; previousIndex: number }> = [];
+
+  for (const [currentIndex, currentNode] of current.nodes.entries()) {
+    const keys = identityKeysForSnapshotNode(currentNode);
+    const matchedPreviousIndex = keys.reduce<number | undefined>((resolved, key) => {
+      if (resolved !== undefined) {
+        return resolved;
+      }
+
+      const candidates = previousIndexesByIdentity.get(key);
+      if (candidates === undefined) {
+        return undefined;
+      }
+
+      return candidates.find((candidateIndex) => !matchedPreviousIndexes.has(candidateIndex));
+    }, undefined);
+
+    if (matchedPreviousIndex !== undefined) {
+      matchedPreviousIndexes.add(matchedPreviousIndex);
+      matchedCurrentIndexes.add(currentIndex);
+      matchedPairs.push({
+        currentIndex,
+        previousIndex: matchedPreviousIndex
+      });
+    }
+  }
+
+  const added = current.nodes.filter((_node, index) => !matchedCurrentIndexes.has(index));
+  const removed = previous.nodes.filter((_node, index) => !matchedPreviousIndexes.has(index));
+
+  const changed = matchedPairs
+    .map(({ currentIndex, previousIndex }) => {
+      const currentNode = current.nodes[currentIndex];
+      const previousNode = previous.nodes[previousIndex];
+      if (currentNode === undefined || previousNode === undefined) {
+        return undefined;
+      }
+
+      const changes = buildChanges(currentNode, previousNode);
+      if (!hasAnyChanges(changes)) {
+        return undefined;
+      }
+
+      return {
+        ref: currentNode.ref,
+        changes
+      };
+    })
+    .filter((entry): entry is SnapshotNodeDiffEntry => entry !== undefined);
+
+  const contextIndexes = new Set<number>();
+  const contextTargetIndexes = new Set<number>([
+    ...added.map((node) => current.nodes.findIndex((candidate) => candidate.ref === node.ref)),
+    ...changed.map((entry) => current.nodes.findIndex((candidate) => candidate.ref === entry.ref))
+  ]);
+
+  for (const contextTargetIndex of contextTargetIndexes) {
+    if (contextTargetIndex <= 0) {
+      continue;
+    }
+
+    const contextStart = Math.max(0, contextTargetIndex - QUERY_ANCESTOR_DEPTH);
+    for (let index = contextStart; index < contextTargetIndex; index += 1) {
+      contextIndexes.add(index);
+    }
+  }
+
+  const targetRefs = new Set<string>([
+    ...added.map((node) => String(node.ref)),
+    ...changed.map((entry) => String(entry.ref))
+  ]);
+  const context = Array.from(contextIndexes)
+    .sort((left, right) => left - right)
+    .map((index) => current.nodes[index])
+    .filter((node): node is SnapshotNode => node !== undefined && !targetRefs.has(String(node.ref)));
+
+  return {
+    added,
+    removed,
+    changed,
+    context
+  };
 };
