@@ -1,7 +1,7 @@
 import os from "node:os";
 import process from "node:process";
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ElectronDriver } from "../driver/index.js";
 import type { AirlockToolContext } from "../server.js";
@@ -10,15 +10,22 @@ import type { SafetyPolicy } from "../types/index.js";
 import { EventLog } from "../utils/event-log.js";
 import type { Logger } from "../utils/logger.js";
 
-const { createRequireMock } = vi.hoisted(() => {
+const { createRequireMock, spawnSyncMock } = vi.hoisted(() => {
   return {
-    createRequireMock: vi.fn()
+    createRequireMock: vi.fn(),
+    spawnSyncMock: vi.fn()
   };
 });
 
 vi.mock("node:module", () => {
   return {
     createRequire: createRequireMock
+  };
+});
+
+vi.mock("node:child_process", () => {
+  return {
+    spawnSync: spawnSyncMock
   };
 });
 
@@ -97,7 +104,14 @@ const createContext = (overrides: Partial<AirlockToolContext> = {}): AirlockTool
   const baseContext: AirlockToolContext = {
     mode: "standard",
     policy: createPolicy(),
-    supportedPresets: ["electron-vite"],
+    preset: "electron-vite",
+    supportedPresets: [
+      "electron-vite",
+      "electron-forge-webpack",
+      "electron-forge-vite",
+      "electron-builder",
+      "pre-launched-attach"
+    ],
     limits: {
       maxNodes: 250,
       maxTextCharsPerNode: 80
@@ -120,10 +134,30 @@ const createContext = (overrides: Partial<AirlockToolContext> = {}): AirlockTool
   };
 };
 
+const mockCommandFound = (binaryPath = "/usr/bin/npx"): void => {
+  spawnSyncMock.mockReturnValue({
+    status: 0,
+    stdout: `${binaryPath}\n`,
+    stderr: "",
+    error: undefined
+  });
+};
+
+const mockCommandMissing = (message = "not found"): void => {
+  spawnSyncMock.mockReturnValue({
+    status: 1,
+    stdout: "",
+    stderr: message,
+    error: undefined
+  });
+};
+
 describe("doctorTool", () => {
   beforeEach(() => {
     vi.resetModules();
     createRequireMock.mockReset();
+    spawnSyncMock.mockReset();
+    mockCommandFound();
   });
 
   it("returns node version", async () => {
@@ -159,7 +193,66 @@ describe("doctorTool", () => {
     });
   });
 
-  it("reports known issues when found", async () => {
+  it("checks active preset dev command availability", async () => {
+    createRequireMock.mockReturnValue(
+      createMockRequire({ playwrightVersion: "1.99.0", electronVersion: "33.0.0" }) as unknown
+    );
+    mockCommandFound("/usr/local/bin/npx");
+
+    const { doctorTool } = await import("./doctor.js");
+    const result = await doctorTool.handler({}, createContext());
+
+    expect(result.data.preset).toEqual(
+      expect.objectContaining({
+        active: "electron-vite",
+        mode: "launch",
+        managesDevServer: true,
+        devServerCommand: "npx electron-vite dev",
+        devServerCommandBinary: "npx",
+        devServerCommandAvailable: true,
+        devServerCommandPath: "/usr/local/bin/npx"
+      })
+    );
+  });
+
+  it("reports command preflight warnings when preset command is missing", async () => {
+    createRequireMock.mockReturnValue(
+      createMockRequire({ playwrightVersion: "1.99.0", electronVersion: "33.0.0" }) as unknown
+    );
+    mockCommandMissing("npx not found");
+
+    const { doctorTool } = await import("./doctor.js");
+    const result = await doctorTool.handler({}, createContext());
+
+    expect(result.data.preset.devServerCommandAvailable).toBe(false);
+    expect(result.meta?.warnings?.some((warning) => warning.includes("Dev server command is not executable"))).toBe(
+      true
+    );
+  });
+
+  it("returns playbook matches and suggestions for attach preset diagnostics", async () => {
+    createRequireMock.mockReturnValue(
+      createMockRequire({ playwrightVersion: "1.99.0", electronVersion: "33.0.0" }) as unknown
+    );
+
+    const { doctorTool } = await import("./doctor.js");
+    const result = await doctorTool.handler(
+      {},
+      createContext({
+        preset: "pre-launched-attach",
+        supportedPresets: ["pre-launched-attach"]
+      })
+    );
+
+    expect(
+      result.data.preflight.playbookMatches.some(
+        (playbook) => playbook.id === "cdp-attach-remote-debugging-not-enabled"
+      )
+    ).toBe(true);
+    expect(result.meta?.suggestions?.some((suggestion) => suggestion.includes("CDP attach failed"))).toBe(true);
+  });
+
+  it("reports known issues when Playwright is unavailable", async () => {
     createRequireMock.mockReturnValue(createMockRequire({}) as unknown);
     const { doctorTool } = await import("./doctor.js");
     const result = await doctorTool.handler({}, createContext());

@@ -119,6 +119,25 @@ describe("event log", () => {
     expect(log.getEntries().map((entry) => entry.toolName)).toEqual(["a", "b", "c"]);
   });
 
+  it("supports additional regex-based redaction patterns", () => {
+    const log = new EventLog();
+    log.addRedactionPatterns(["sk-[a-zA-Z0-9]{10,}"]);
+
+    const recorded = log.record({
+      toolName: "token_test",
+      params: {
+        message: "token sk-abcDEF123456 should not be visible"
+      },
+      resultSummary: baseResultSummary,
+      durationMs: 7,
+      timestamp: "2024-01-01T00:00:00.000Z"
+    });
+
+    expect(recorded.params).toEqual({
+      message: "token [REDACTED] should not be visible"
+    });
+  });
+
   it("clears entries", () => {
     const log = new EventLog();
 

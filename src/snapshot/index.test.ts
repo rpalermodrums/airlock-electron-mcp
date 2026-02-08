@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 
 import type { RawSnapshot, RawSnapshotNode, RawSnapshotRect } from "../driver/index.js";
-import { sessionId, windowId } from "../types/session.js";
+import { refId, sessionId, windowId, type Snapshot } from "../types/session.js";
 import {
   buildQuerySnapshot,
+  buildRegionSnapshot,
   buildSnapshot,
+  buildSnapshotDiff,
   buildViewportSnapshot,
+  findSnapshotNodeBounds,
   type SnapshotOptions,
   type ViewportRect
 } from "./index.js";
@@ -486,5 +489,195 @@ describe("snapshot/index", () => {
     expect(snapshot.nodes.map((node) => node.name)).toEqual(["Content Region", "Row 1", "Open Report"]);
     expect(snapshot.nodes.map((node) => node.role)).toEqual(["generic", "generic", "link"]);
     expect(snapshot.nodes.map((node) => node.name)).not.toContain("Airlock Main");
+  });
+
+  it("buildRegionSnapshot() returns nodes intersecting the given region with ancestor context", () => {
+    const snapshot = buildRegionSnapshot(
+      createRawSnapshot(),
+      {
+        x: 0,
+        y: 80,
+        width: 320,
+        height: 80
+      },
+      createSnapshotOptions("region", "all")
+    );
+
+    const names = snapshot.nodes.map((node) => node.name);
+    expect(names).toContain("Airlock Main");
+    expect(names).toContain("Toolbar");
+    expect(names).toContain("Save");
+    expect(names).toContain("Delete");
+    expect(names).not.toContain("Open Analytics");
+    expect(snapshot.metadata?.note).toBe("region");
+  });
+
+  it("buildRegionSnapshot() can return an empty node set when region has no intersections", () => {
+    const snapshot = buildRegionSnapshot(
+      createRawSnapshot(),
+      {
+        x: 5000,
+        y: 5000,
+        width: 50,
+        height: 50
+      },
+      createSnapshotOptions("region-empty", "all")
+    );
+
+    expect(snapshot.nodes).toEqual([]);
+    expect(snapshot.metadata?.note).toBe("region");
+  });
+
+  it("findSnapshotNodeBounds() resolves raw node bounds from snapshot identity hints", () => {
+    const snapshot = buildSnapshot(createRawSnapshot(), createSnapshotOptions("bounds", "all"));
+    const saveNode = snapshot.nodes.find((node) => node.name === "Save");
+
+    expect(saveNode).toBeDefined();
+    expect(findSnapshotNodeBounds(createRawSnapshot(), saveNode!)).toEqual({
+      x: 20,
+      y: 90,
+      width: 100,
+      height: 30
+    });
+  });
+
+  it("findSnapshotNodeBounds() returns undefined when no identity match exists", () => {
+    const missingNode: Snapshot["nodes"][number] = {
+      ref: refId("e404"),
+      role: "button",
+      name: "Missing",
+      locatorHints: {
+        testId: "does-not-exist"
+      }
+    };
+
+    expect(findSnapshotNodeBounds(createRawSnapshot(), missingNode)).toBeUndefined();
+  });
+
+  it("buildSnapshotDiff() reports added/removed/changed nodes and context", () => {
+    const previous: Snapshot = {
+      sessionId: sessionId("diff-s1"),
+      windowId: windowId("diff-w1"),
+      version: 1,
+      createdAt: "2026-02-07T00:00:00.000Z",
+      truncated: false,
+      nodes: [
+        {
+          ref: refId("e1"),
+          role: "button",
+          name: "Save",
+          locatorHints: {
+            testId: "save-btn"
+          }
+        },
+        {
+          ref: refId("e2"),
+          role: "checkbox",
+          name: "Enable sync",
+          checked: true,
+          locatorHints: {
+            testId: "sync-toggle"
+          }
+        },
+        {
+          ref: refId("e3"),
+          role: "link",
+          name: "Docs",
+          locatorHints: {
+            roleAndName: {
+              role: "link",
+              name: "Docs"
+            }
+          }
+        }
+      ]
+    };
+    const current: Snapshot = {
+      sessionId: sessionId("diff-s1"),
+      windowId: windowId("diff-w1"),
+      version: 2,
+      createdAt: "2026-02-07T00:00:01.000Z",
+      truncated: false,
+      nodes: [
+        {
+          ref: refId("e1"),
+          role: "button",
+          name: "Save Now",
+          disabled: true,
+          locatorHints: {
+            testId: "save-btn"
+          }
+        },
+        {
+          ref: refId("e2"),
+          role: "link",
+          name: "Docs",
+          locatorHints: {
+            roleAndName: {
+              role: "link",
+              name: "Docs"
+            }
+          }
+        },
+        {
+          ref: refId("e3"),
+          role: "button",
+          name: "Delete",
+          locatorHints: {
+            testId: "delete-btn"
+          }
+        }
+      ]
+    };
+
+    const diff = buildSnapshotDiff(current, previous);
+
+    expect(diff.added.map((node) => node.name)).toEqual(["Delete"]);
+    expect(diff.removed.map((node) => node.name)).toEqual(["Enable sync"]);
+    expect(diff.changed).toEqual([
+      {
+        ref: "e1",
+        changes: {
+          name: {
+            before: "Save",
+            after: "Save Now"
+          },
+          disabled: {
+            before: undefined,
+            after: true
+          }
+        }
+      }
+    ]);
+    expect(diff.context.map((node) => node.name)).toEqual(["Docs"]);
+  });
+
+  it("buildSnapshotDiff() returns empty sections for identical snapshots", () => {
+    const baseline: Snapshot = {
+      sessionId: sessionId("diff-identical-s1"),
+      windowId: windowId("diff-identical-w1"),
+      version: 1,
+      createdAt: "2026-02-07T00:00:00.000Z",
+      truncated: false,
+      nodes: [
+        {
+          ref: refId("e1"),
+          role: "button",
+          name: "Save",
+          locatorHints: {
+            testId: "save-btn"
+          }
+        }
+      ]
+    };
+
+    const diff = buildSnapshotDiff(baseline, baseline);
+
+    expect(diff).toEqual({
+      added: [],
+      removed: [],
+      changed: [],
+      context: []
+    });
   });
 });

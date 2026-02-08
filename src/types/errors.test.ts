@@ -39,6 +39,21 @@ describe("error types", () => {
     });
   });
 
+  it("supports confirmation metadata on errors", () => {
+    const error = createAirlockError("POLICY_VIOLATION", "Confirmation required", false, undefined, {
+      requiresConfirmation: true,
+      confirmationId: "confirm-123"
+    });
+
+    expect(error).toEqual({
+      code: "POLICY_VIOLATION",
+      message: "Confirmation required",
+      retriable: false,
+      requiresConfirmation: true,
+      confirmationId: "confirm-123"
+    });
+  });
+
   it("matches the AirlockError structure", () => {
     const error: AirlockError = createAirlockError("WINDOW_NOT_FOUND", "missing window");
 

@@ -7,7 +7,7 @@ import type { SafetyPolicy, Window } from "../types/index.js";
 import { sessionId, windowId } from "../types/index.js";
 import { EventLog } from "../utils/event-log.js";
 import type { Logger } from "../utils/logger.js";
-import { resolveManagedSession, resolveWindow, toActionToolResult } from "./helpers.js";
+import { isLikelyModal, resolveManagedSession, resolveWindow, toActionToolResult } from "./helpers.js";
 
 const createDriver = (): ElectronDriver => {
   return {
@@ -18,6 +18,7 @@ const createDriver = (): ElectronDriver => {
     performAction: vi.fn(),
     screenshot: vi.fn(),
     getConsoleLogs: vi.fn(),
+    getNetworkLogs: vi.fn(),
     close: vi.fn()
   } as unknown as ElectronDriver;
 };
@@ -43,15 +44,25 @@ const createPolicy = (): SafetyPolicy => {
   };
 };
 
-const createWindow = (id: string, title: string): Window => {
+const createWindow = (
+  id: string,
+  title: string,
+  options: {
+    url?: string;
+    kind?: Window["kind"];
+    focused?: boolean;
+    visible?: boolean;
+    lastSeenAt?: string;
+  } = {}
+): Window => {
   return {
     windowId: windowId(id),
     title,
-    url: `https://example.com/${id}`,
-    kind: "primary",
-    focused: id === "w1",
-    visible: true,
-    lastSeenAt: "2026-01-01T00:00:00.000Z"
+    url: options.url ?? `https://example.com/${id}`,
+    kind: options.kind ?? "primary",
+    focused: options.focused ?? id === "w1",
+    visible: options.visible ?? true,
+    lastSeenAt: options.lastSeenAt ?? "2026-01-01T00:00:00.000Z"
   };
 };
 
@@ -60,9 +71,12 @@ const createManagedSession = (
     selectedWindowId?: string;
     windows?: readonly Window[];
     includeDriverSession?: boolean;
+    defaultWindowId?: string;
+    lastInteractedWindowId?: string;
+    lastFocusedPrimaryWindowId?: string;
   } = {}
 ): ManagedSession => {
-  const windows = options.windows ?? [createWindow("w1", "Main"), createWindow("w2", "Settings")];
+  const windows = options.windows ?? [createWindow("w1", "Main"), createWindow("w2", "Workspace")];
   const driverSession: DriverSession | undefined =
     options.includeDriverSession === false
       ? undefined
@@ -84,6 +98,13 @@ const createManagedSession = (
       selectedWindowId: options.selectedWindowId === undefined ? undefined : windowId(options.selectedWindowId),
       windows: [...windows]
     },
+    ...(options.defaultWindowId === undefined ? {} : { defaultWindowId: windowId(options.defaultWindowId) }),
+    ...(options.lastInteractedWindowId === undefined
+      ? {}
+      : { lastInteractedWindowId: windowId(options.lastInteractedWindowId) }),
+    ...(options.lastFocusedPrimaryWindowId === undefined
+      ? {}
+      : { lastFocusedPrimaryWindowId: windowId(options.lastFocusedPrimaryWindowId) }),
     ...(driverSession === undefined ? {} : { driverSession })
   };
 };
@@ -144,12 +165,12 @@ describe("tool helpers", () => {
     expect(error.code).toBe("SESSION_NOT_FOUND");
   });
 
-  it("resolveWindow() returns default window when no windowId specified", () => {
+  it("resolveWindow() returns default heuristic window when no windowId specified", () => {
     const managedSession = createManagedSession({
-      windows: [createWindow("w1", "Main"), createWindow("w2", "Settings")]
+      windows: [createWindow("w1", "Main"), createWindow("w2", "Workspace")]
     });
 
-    const resolvedWindow = resolveWindow(managedSession);
+    const resolvedWindow = resolveWindow(managedSession, undefined, { trackAsInteracted: false });
 
     expect(resolvedWindow.windowId).toBe(windowId("w1"));
     expect(resolvedWindow.title).toBe("Main");
@@ -157,13 +178,100 @@ describe("tool helpers", () => {
 
   it("resolveWindow() returns specific window when windowId provided", () => {
     const managedSession = createManagedSession({
-      windows: [createWindow("w1", "Main"), createWindow("w2", "Settings")]
+      windows: [createWindow("w1", "Main"), createWindow("w2", "Workspace")],
+      defaultWindowId: "w1"
     });
 
-    const resolvedWindow = resolveWindow(managedSession, "w2");
+    const resolvedWindow = resolveWindow(managedSession, "w2", { trackAsInteracted: false });
 
     expect(resolvedWindow.windowId).toBe(windowId("w2"));
-    expect(resolvedWindow.title).toBe("Settings");
+    expect(resolvedWindow.title).toBe("Workspace");
+  });
+
+  it("resolveWindow() prioritizes configured default over modal candidates", () => {
+    const managedSession = createManagedSession({
+      windows: [
+        createWindow("w1", "Main", { kind: "primary", focused: true }),
+        createWindow("w2", "Confirm Delete", { kind: "utility", focused: false })
+      ],
+      defaultWindowId: "w1"
+    });
+
+    const diagnostics: Record<string, unknown> = {};
+    const resolvedWindow = resolveWindow(managedSession, undefined, {
+      diagnostics,
+      trackAsInteracted: false
+    });
+
+    expect(resolvedWindow.windowId).toBe(windowId("w1"));
+    expect(diagnostics).toMatchObject({
+      windowSelection: {
+        strategy: "default_window",
+        selectedWindowId: "w1"
+      }
+    });
+  });
+
+  it("resolveWindow() prioritizes likely modal over last interacted window", () => {
+    const managedSession = createManagedSession({
+      windows: [
+        createWindow("w1", "Main", { kind: "primary", focused: true }),
+        createWindow("w2", "Alert: Save changes", { kind: "utility", focused: false }),
+        createWindow("w3", "Workspace", { kind: "utility", focused: false })
+      ],
+      lastInteractedWindowId: "w3"
+    });
+
+    const resolvedWindow = resolveWindow(managedSession, undefined, { trackAsInteracted: false });
+
+    expect(resolvedWindow.windowId).toBe(windowId("w2"));
+  });
+
+  it("resolveWindow() prioritizes last interacted over focused primary", () => {
+    const managedSession = createManagedSession({
+      windows: [
+        createWindow("w1", "Main", { kind: "primary", focused: true }),
+        createWindow("w2", "Workspace", { kind: "utility", focused: false })
+      ],
+      lastInteractedWindowId: "w2"
+    });
+
+    const diagnostics: Record<string, unknown> = {};
+    const resolvedWindow = resolveWindow(managedSession, undefined, {
+      diagnostics,
+      trackAsInteracted: false
+    });
+
+    expect(resolvedWindow.windowId).toBe(windowId("w2"));
+    expect(diagnostics).toMatchObject({
+      windowSelection: {
+        strategy: "most_recently_interacted_window",
+        selectedWindowId: "w2"
+      }
+    });
+  });
+
+  it("resolveWindow() falls back to first non-devtools window", () => {
+    const managedSession = createManagedSession({
+      windows: [
+        createWindow("devtools", "DevTools", { kind: "devtools", focused: false }),
+        createWindow("w2", "Secondary", { kind: "utility", focused: false })
+      ]
+    });
+
+    const diagnostics: Record<string, unknown> = {};
+    const resolvedWindow = resolveWindow(managedSession, undefined, {
+      diagnostics,
+      trackAsInteracted: false
+    });
+
+    expect(resolvedWindow.windowId).toBe(windowId("w2"));
+    expect(diagnostics).toMatchObject({
+      windowSelection: {
+        strategy: "first_non_devtools_window",
+        selectedWindowId: "w2"
+      }
+    });
   });
 
   it("resolveWindow() throws WINDOW_NOT_FOUND for invalid windowId", () => {
@@ -176,6 +284,46 @@ describe("tool helpers", () => {
     }) as { code: string };
 
     expect(error.code).toBe("WINDOW_NOT_FOUND");
+  });
+
+  it("isLikelyModal() detects modal title/url patterns", () => {
+    const windows: [Window, Window, Window] = [
+      createWindow("w1", "Main", { kind: "primary", focused: true }),
+      createWindow("w2", "Preferences", { kind: "utility", focused: false }),
+      createWindow("w3", "Popup", { kind: "utility", focused: false, url: "about:blank" })
+    ];
+    const [, preferencesWindow, popupWindow] = windows;
+
+    expect(isLikelyModal(preferencesWindow, windows)).toBe(true);
+    expect(isLikelyModal(popupWindow, windows)).toBe(true);
+  });
+
+  it("isLikelyModal() detects dialog/alert type hints when present", () => {
+    const typedDialogWindow = {
+      ...createWindow("w2", "Untitled", { kind: "utility", focused: false }),
+      type: "dialog"
+    } as Window;
+
+    expect(isLikelyModal(typedDialogWindow, [createWindow("w1", "Main"), typedDialogWindow])).toBe(true);
+  });
+
+  it("isLikelyModal() can use size heuristic when bounds are present", () => {
+    const mainWindow = {
+      ...createWindow("w1", "Main", { kind: "primary", focused: true }),
+      bounds: {
+        width: 1400,
+        height: 1000
+      }
+    } as Window;
+    const smallWindow = {
+      ...createWindow("w2", "Inspector", { kind: "utility", focused: false }),
+      bounds: {
+        width: 600,
+        height: 420
+      }
+    } as Window;
+
+    expect(isLikelyModal(smallWindow, [mainWindow, smallWindow])).toBe(true);
   });
 
   it("toActionToolResult() wraps ActionResult in ToolResult with suggestions", () => {

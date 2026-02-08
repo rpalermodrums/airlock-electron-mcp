@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { refId, type SnapshotNode } from "../types/session.js";
+import { refId, sessionId, windowId, type Snapshot, type SnapshotNode } from "../types/session.js";
 import { RefMap, type SelectorDescriptor } from "./ref-map.js";
 
 const createSnapshotNodes = (): readonly SnapshotNode[] => [
@@ -210,5 +210,196 @@ describe("snapshot/ref-map", () => {
     expect(refMap.resolveRef("e2")?.type).toBe("role");
     expect(refMap.resolveRef("e3")?.type).toBe("label");
     expect(refMap.resolveRef("e4")?.type).toBe("text");
+  });
+
+  it("reResolveRef() maps stale refs to the current ref using descriptor hints", () => {
+    const refMap = new RefMap();
+    refMap.rebuildFromSnapshot([
+      {
+        ref: refId("e10"),
+        role: "button",
+        name: "Save",
+        locatorHints: {
+          testId: "save-btn"
+        }
+      }
+    ]);
+    refMap.rebuildFromSnapshot([
+      {
+        ref: refId("e1"),
+        role: "button",
+        name: "Save",
+        locatorHints: {
+          testId: "save-btn"
+        }
+      }
+    ]);
+
+    const currentSnapshot: Snapshot = {
+      sessionId: sessionId("s1"),
+      windowId: windowId("w1"),
+      version: 2,
+      createdAt: "2026-02-07T00:00:00.000Z",
+      truncated: false,
+      nodes: [
+        {
+          ref: refId("e1"),
+          role: "button",
+          name: "Save",
+          locatorHints: {
+            testId: "save-btn"
+          }
+        }
+      ]
+    };
+
+    expect(refMap.reResolveRef(refId("e10"), currentSnapshot)).toBe(refId("e1"));
+  });
+
+  it("reResolveRef() returns null when stale ref cannot be matched", () => {
+    const refMap = new RefMap();
+    refMap.rebuildFromSnapshot([
+      {
+        ref: refId("e11"),
+        role: "button",
+        name: "Save",
+        locatorHints: {
+          testId: "save-btn"
+        }
+      }
+    ]);
+    refMap.rebuildFromSnapshot([
+      {
+        ref: refId("e1"),
+        role: "button",
+        name: "Archive",
+        locatorHints: {
+          testId: "archive-btn"
+        }
+      }
+    ]);
+
+    const currentSnapshot: Snapshot = {
+      sessionId: sessionId("s1"),
+      windowId: windowId("w1"),
+      version: 2,
+      createdAt: "2026-02-07T00:00:00.000Z",
+      truncated: false,
+      nodes: [
+        {
+          ref: refId("e1"),
+          role: "button",
+          name: "Archive",
+          locatorHints: {
+            testId: "archive-btn"
+          }
+        }
+      ]
+    };
+
+    expect(refMap.reResolveRef(refId("e11"), currentSnapshot)).toBeNull();
+  });
+
+  it("reResolveRef() throws REF_STALE when matching is ambiguous", () => {
+    const refMap = new RefMap();
+    refMap.rebuildFromSnapshot([
+      {
+        ref: refId("e12"),
+        role: "button",
+        name: "Save",
+        locatorHints: {
+          testId: "save-btn"
+        }
+      }
+    ]);
+    refMap.rebuildFromSnapshot([
+      {
+        ref: refId("e1"),
+        role: "button",
+        name: "Save",
+        locatorHints: {
+          testId: "save-btn"
+        }
+      },
+      {
+        ref: refId("e2"),
+        role: "button",
+        name: "Save secondary",
+        locatorHints: {
+          testId: "save-btn"
+        }
+      }
+    ]);
+
+    const currentSnapshot: Snapshot = {
+      sessionId: sessionId("s1"),
+      windowId: windowId("w1"),
+      version: 2,
+      createdAt: "2026-02-07T00:00:00.000Z",
+      truncated: false,
+      nodes: [
+        {
+          ref: refId("e1"),
+          role: "button",
+          name: "Save",
+          locatorHints: {
+            testId: "save-btn"
+          }
+        },
+        {
+          ref: refId("e2"),
+          role: "button",
+          name: "Save secondary",
+          locatorHints: {
+            testId: "save-btn"
+          }
+        }
+      ]
+    };
+
+    const thrown = (() => {
+      try {
+        refMap.reResolveRef(refId("e12"), currentSnapshot);
+      } catch (error: unknown) {
+        return error;
+      }
+
+      throw new Error("Expected reResolveRef() to throw on ambiguous matches.");
+    })();
+
+    expect(thrown).toMatchObject({
+      code: "REF_STALE"
+    });
+  });
+
+  it("resolveRef() re-resolves stale refs and returns the current descriptor when available", () => {
+    const refMap = new RefMap();
+    refMap.rebuildFromSnapshot([
+      {
+        ref: refId("e1"),
+        role: "button",
+        name: "Save",
+        locatorHints: {
+          label: "Shared label"
+        }
+      }
+    ]);
+    refMap.rebuildFromSnapshot([
+      {
+        ref: refId("e2"),
+        role: "button",
+        name: "Save",
+        locatorHints: {
+          testId: "save-btn",
+          label: "Shared label"
+        }
+      }
+    ]);
+
+    expect(refMap.resolveRef("e1")).toEqual({
+      type: "testId",
+      value: "save-btn",
+      priority: 100
+    });
   });
 });

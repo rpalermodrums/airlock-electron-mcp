@@ -6,7 +6,8 @@ import { z } from "zod";
 
 import type { ElectronDriver } from "./driver/index.js";
 import { AirlockServer, defineAirlockTool } from "./server.js";
-import type { SafetyMode, SafetyPolicy } from "./types/index.js";
+import type { ResolvedPolicy, SafetyMode } from "./types/index.js";
+import { confirmTool } from "./tools/confirm.js";
 
 const {
   mcpConstructorMock,
@@ -71,12 +72,13 @@ vi.mock("./utils/logger.js", () => {
   };
 });
 
-const createPolicy = (mode: SafetyMode): SafetyPolicy => {
+const createPolicy = (mode: SafetyMode, overrides: Partial<ResolvedPolicy> = {}): ResolvedPolicy => {
   return {
     mode,
     allowedOrigins: ["http://localhost"],
     artifactRoot: "/tmp/airlock-tests",
-    maxSessionTtlMs: 30_000
+    maxSessionTtlMs: 30_000,
+    ...overrides
   };
 };
 
@@ -93,9 +95,12 @@ const createDriver = (): ElectronDriver => {
   } as unknown as ElectronDriver;
 };
 
-const createServer = async (mode: SafetyMode = "standard"): Promise<AirlockServer> => {
+const createServer = async (
+  mode: SafetyMode = "standard",
+  policyOverrides: Partial<ResolvedPolicy> = {}
+): Promise<AirlockServer> => {
   return AirlockServer.create({
-    policy: createPolicy(mode),
+    policy: createPolicy(mode, policyOverrides),
     supportedPresets: ["electron-vite"],
     limits: {
       maxNodes: 250,
@@ -175,6 +180,185 @@ describe("server", () => {
     expect(result.isError).toBe(true);
     expect(result.structuredContent.ok).toBe(false);
     expect(result.structuredContent.error.code).toBe("MODE_RESTRICTED");
+  });
+
+  it("rejects tools disabled by policy", async () => {
+    const server = await createServer("standard", {
+      tools: {
+        disabled: ["disabled_tool"],
+        requireConfirmation: []
+      }
+    });
+    const disabledTool = defineAirlockTool({
+      name: "disabled_tool",
+      title: "Disabled Tool",
+      description: "Blocked by policy.",
+      inputSchema: z.object({}).strict(),
+      outputSchema: z.object({ ok: z.boolean() }).strict(),
+      handler: async () => ({
+        data: { ok: true }
+      })
+    });
+
+    server.registerTools([disabledTool]);
+    const handler = getRegisteredHandler("disabled_tool");
+    const result = (await handler({})) as {
+      isError: boolean;
+      structuredContent: {
+        ok: boolean;
+        error: { code: string };
+      };
+    };
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent.ok).toBe(false);
+    expect(result.structuredContent.error.code).toBe("POLICY_VIOLATION");
+  });
+
+  it("returns a confirmation gate for tools that require confirmation by policy", async () => {
+    const server = await createServer("standard", {
+      tools: {
+        disabled: [],
+        requireConfirmation: ["confirm_tool"]
+      }
+    });
+    const confirmTool = defineAirlockTool({
+      name: "confirm_tool",
+      title: "Confirm Tool",
+      description: "Requires confirmation.",
+      inputSchema: z
+        .object({
+          value: z.string().min(1)
+        })
+        .strict(),
+      outputSchema: z.object({ ok: z.boolean() }).strict(),
+      handler: async () => ({
+        data: { ok: true }
+      })
+    });
+
+    server.registerTools([confirmTool]);
+    const handler = getRegisteredHandler("confirm_tool");
+    const result = (await handler({ value: "run" })) as {
+      structuredContent: {
+        ok: boolean;
+        requiresConfirmation?: boolean;
+        confirmationId?: string;
+        description?: string;
+      };
+    };
+
+    expect(result.structuredContent.ok).toBe(false);
+    expect(result.structuredContent.requiresConfirmation).toBe(true);
+    expect(result.structuredContent.confirmationId).toEqual(expect.any(String));
+    expect(result.structuredContent.description).toContain("requires confirmation");
+  });
+
+  it("supports full confirmation flow: gate -> confirm -> re-invoke", async () => {
+    const server = await createServer("standard", {
+      tools: {
+        disabled: [],
+        requireConfirmation: ["dangerous_tool"]
+      }
+    });
+    const dangerousTool = defineAirlockTool({
+      name: "dangerous_tool",
+      title: "Dangerous Tool",
+      description: "A gated tool.",
+      inputSchema: z
+        .object({
+          value: z.string().min(1)
+        })
+        .strict(),
+      outputSchema: z
+        .object({
+          ok: z.boolean(),
+          value: z.string()
+        })
+        .strict(),
+      handler: async (input) => ({
+        data: { ok: true, value: input.value }
+      })
+    });
+
+    server.registerTools([dangerousTool, confirmTool]);
+
+    const dangerousHandler = getRegisteredHandler("dangerous_tool");
+    const confirmHandler = getRegisteredHandler("confirm");
+    const firstResponse = (await dangerousHandler({ value: "run" })) as {
+      structuredContent: {
+        ok: boolean;
+        requiresConfirmation?: boolean;
+        confirmationId?: string;
+      };
+    };
+    const confirmationId = firstResponse.structuredContent.confirmationId;
+
+    expect(firstResponse.structuredContent.ok).toBe(false);
+    expect(firstResponse.structuredContent.requiresConfirmation).toBe(true);
+    expect(confirmationId).toEqual(expect.any(String));
+
+    const confirmResponse = (await confirmHandler({ confirmationId })) as {
+      structuredContent: {
+        ok: boolean;
+        result: {
+          data: {
+            ok: boolean;
+            toolName: string;
+            params: unknown;
+          };
+        };
+      };
+    };
+
+    expect(confirmResponse.structuredContent.ok).toBe(true);
+    expect(confirmResponse.structuredContent.result.data.ok).toBe(true);
+    expect(confirmResponse.structuredContent.result.data.toolName).toBe("dangerous_tool");
+    expect(confirmResponse.structuredContent.result.data.params).toEqual({ value: "run" });
+
+    const finalResponse = (await dangerousHandler({ value: "run", confirmationId })) as {
+      structuredContent: {
+        ok: boolean;
+        result: {
+          data: { ok: boolean; value: string };
+        };
+      };
+    };
+
+    expect(finalResponse.structuredContent.ok).toBe(true);
+    expect(finalResponse.structuredContent.result.data).toEqual({
+      ok: true,
+      value: "run"
+    });
+  });
+
+  it("applies policy redaction patterns to server event logs", async () => {
+    const server = await createServer("standard", {
+      redactionPatterns: ["ghp_[a-zA-Z0-9]{36}"]
+    });
+    const redactTool = defineAirlockTool({
+      name: "redact_tool",
+      title: "Redact Tool",
+      description: "Records input parameters.",
+      inputSchema: z
+        .object({
+          message: z.string().min(1)
+        })
+        .strict(),
+      outputSchema: z.object({ ok: z.boolean() }).strict(),
+      handler: async () => ({
+        data: { ok: true }
+      })
+    });
+
+    server.registerTools([redactTool]);
+    const handler = getRegisteredHandler("redact_tool");
+    await handler({ message: "token ghp_abcdefghijklmnopqrstuvwxyz0123456789 secret" });
+
+    const [event] = server.getEventLog().list(1);
+    expect(event?.params).toEqual({
+      message: "token [REDACTED] secret"
+    });
   });
 
   it("rejects invalid tool input with INVALID_INPUT", async () => {
