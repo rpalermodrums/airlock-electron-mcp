@@ -5,6 +5,8 @@ author: ""
 subtitle: "Airlock - Electron MCP server for agentic, safety-scoped UI automation"
 ---
 
+> **Implementation status:** V1 Phase 0+1 has been implemented. See [airlock-v1-status.md](./airlock-v1-status.md) for the actual implementation state, divergences from this plan, and deferred items.
+
 # Contents
 
 - Executive summary
