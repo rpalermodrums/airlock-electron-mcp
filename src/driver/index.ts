@@ -11,11 +11,18 @@ export interface DriverLaunchConfig {
   firstWindowTimeoutMs?: number;
 }
 
+export interface DriverAttachTargetSelection {
+  targetUrlIncludes?: string;
+  targetType?: string;
+  preferNonDevtools?: boolean;
+}
+
 export interface DriverAttachConfig {
   sessionId?: string;
   cdpUrl?: string;
   wsEndpoint?: string;
   timeoutMs?: number;
+  targetSelection?: DriverAttachTargetSelection;
 }
 
 export interface DriverSession {
@@ -116,14 +123,36 @@ export interface ConsoleEntry {
   timestamp: string;
 }
 
+export interface NetworkEntry {
+  url: string;
+  method: string;
+  status: number;
+  mimeType: string;
+  timestamp: string;
+}
+
+export interface NetworkLogOptions {
+  windowId?: string;
+  limit?: number;
+}
+
+export interface DriverTraceOptions {
+  screenshots?: boolean;
+  snapshots?: boolean;
+}
+
 export interface ElectronDriver {
   launch(config: DriverLaunchConfig): Promise<DriverSession>;
   attach(config: DriverAttachConfig): Promise<DriverSession>;
   getWindows(session: DriverSession): Promise<DriverWindow[]>;
+  startTracing(session: DriverSession, options?: DriverTraceOptions): Promise<void>;
+  stopTracing(session: DriverSession, savePath: string): Promise<void>;
   getSnapshot(window: DriverWindow, options?: Record<string, unknown>): Promise<RawSnapshot>;
   performAction(window: DriverWindow, action: DriverAction): Promise<ActionResult>;
   screenshot(window: DriverWindow, options?: ScreenshotOptions): Promise<Buffer>;
+  focusWindow(session: DriverSession, windowId: string): Promise<void>;
   getConsoleLogs(session: DriverSession, options?: ConsoleLogOptions): Promise<ConsoleEntry[]>;
+  getNetworkLogs(session: DriverSession, options?: NetworkLogOptions): Promise<NetworkEntry[]>;
   close(session: DriverSession): Promise<void>;
   evaluate?(window: DriverWindow, fn: string): Promise<unknown>;
 }

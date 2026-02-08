@@ -13,6 +13,9 @@ import type {
   DriverAction,
   DriverAttachConfig,
   DriverLaunchConfig,
+  DriverTraceOptions,
+  NetworkEntry,
+  NetworkLogOptions,
   DriverSession,
   DriverWindow,
   ElectronDriver,
@@ -25,6 +28,7 @@ import type {
 type ElectronApplication = Awaited<ReturnType<typeof _electron.launch>>;
 type CDPBrowser = Awaited<ReturnType<typeof chromium.connectOverCDP>>;
 type Page = Awaited<ReturnType<ElectronApplication["firstWindow"]>>;
+type BrowserContext = ReturnType<ElectronApplication["context"]>;
 type Locator = ReturnType<Page["locator"]>;
 
 interface SnapshotRefDescriptor {
@@ -43,12 +47,18 @@ interface DriverRuntime {
   pageIds: WeakMap<Page, string>;
   refDescriptorsByWindowId: Map<string, Map<string, SnapshotRefDescriptor>>;
   consoleEntries: ConsoleEntry[];
+  networkEntries: RuntimeNetworkEntry[];
   teardownCallbacks: Array<() => void>;
   windowSequence: {
     value: number;
   };
+  tracingActive: boolean;
   recentStdout: LineRingBuffer;
   recentStderr: LineRingBuffer;
+}
+
+interface RuntimeNetworkEntry extends NetworkEntry {
+  windowId: string;
 }
 
 interface AccessibilityNode {
@@ -72,7 +82,9 @@ const DEFAULT_ATTACH_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_SNAPSHOT_NODES = 500;
 const DEFAULT_MAX_TEXT_CHARS = 240;
 const DEFAULT_CONSOLE_LIMIT = 100;
+const DEFAULT_NETWORK_LIMIT = 100;
 const CONSOLE_BUFFER_LIMIT = 500;
+const NETWORK_BUFFER_LIMIT = 1000;
 const DIAGNOSTIC_RING_LINES = 80;
 
 const LEVEL_PRIORITY: Record<ConsoleEntry["level"], number> = {
@@ -244,6 +256,15 @@ const classifyWindowKind = (url: string): DriverWindow["kind"] => {
   return "primary";
 };
 
+const isDevtoolsTargetUrl = (url: string | undefined): boolean => {
+  if (url === undefined) {
+    return false;
+  }
+
+  const normalized = url.trim().toLowerCase();
+  return normalized.startsWith("devtools://") || normalized.startsWith("chrome-devtools://");
+};
+
 const mapConsoleLevel = (type: string): ConsoleEntry["level"] => {
   if (type === "error") {
     return "error";
@@ -315,6 +336,21 @@ const parseCallArgumentString = (
 
   const argumentText = selector.slice(prefix.length, -1).trim();
   return parseJsonString(argumentText);
+};
+
+const extractMimeType = (headers: Record<string, string> | undefined): string => {
+  if (headers === undefined) {
+    return "unknown";
+  }
+
+  const matched = Object.entries(headers).find(([key]) => key.toLowerCase() === "content-type");
+  if (matched === undefined) {
+    return "unknown";
+  }
+
+  const value = matched[1];
+  const mimeType = value.split(";")[0]?.trim();
+  return mimeType === undefined || mimeType.length === 0 ? "unknown" : mimeType;
 };
 
 const maybeParseNode = (value: unknown): AccessibilityNode | null => {
@@ -634,34 +670,60 @@ export class PlaywrightElectronDriver implements ElectronDriver {
         timeout: timeoutMs
       });
       const cdpTargets = await (async (): Promise<{
-        targets: readonly { type?: string; url?: string; targetId?: string }[];
+        targets: readonly { type?: string; url?: string; targetId?: string; title?: string }[];
         primaryRendererTargetId?: string;
         primaryRendererUrl?: string;
+        selectionRationale: string;
       }> => {
         try {
           const cdpSession = await browser.newBrowserCDPSession();
           const response = (await cdpSession.send("Target.getTargets")) as {
-            targetInfos?: Array<{ type?: string; url?: string; targetId?: string }>;
+            targetInfos?: Array<{ type?: string; url?: string; targetId?: string; title?: string }>;
           };
           await cdpSession.detach();
           const targets = Array.isArray(response.targetInfos) ? response.targetInfos : [];
-          const primaryRenderer =
-            targets.find(
-              (target) =>
-                target.type === "page" &&
-                typeof target.url === "string" &&
-                !target.url.toLowerCase().startsWith("devtools://") &&
-                !target.url.toLowerCase().startsWith("chrome-devtools://")
-            ) ?? targets.find((target) => target.type === "page");
+          const pageTargets = targets.filter((target) => target.type === "page");
+          const selection = config.targetSelection;
+          const expectedType = selection?.targetType;
+          const expectedUrlToken = selection?.targetUrlIncludes;
+          const preferNonDevtools = selection?.preferNonDevtools ?? true;
+
+          const byType =
+            expectedType === undefined
+              ? pageTargets
+              : pageTargets.filter((target) => {
+                  return target.type === expectedType;
+                });
+          const byUrl =
+            expectedUrlToken === undefined
+              ? byType
+              : byType.filter((target) => {
+                  return typeof target.url === "string" && target.url.includes(expectedUrlToken);
+                });
+          const preferredSet = byUrl.length > 0 ? byUrl : byType.length > 0 ? byType : pageTargets;
+          const withDevtoolsPreference = preferNonDevtools
+            ? preferredSet.filter((target) => !isDevtoolsTargetUrl(target.url))
+            : preferredSet;
+          const selectedTarget = withDevtoolsPreference[0] ?? preferredSet[0] ?? pageTargets[0] ?? targets[0];
+          const selectionRationale =
+            expectedUrlToken !== undefined && byUrl.length > 0
+              ? `selected by targetUrlIncludes=\"${expectedUrlToken}\"`
+              : expectedType !== undefined && byType.length > 0
+                ? `selected by targetType=\"${expectedType}\"`
+                : preferNonDevtools
+                  ? "selected first non-devtools page target"
+                  : "selected first available page target";
 
           return {
             targets,
-            ...(primaryRenderer?.targetId === undefined ? {} : { primaryRendererTargetId: primaryRenderer.targetId }),
-            ...(primaryRenderer?.url === undefined ? {} : { primaryRendererUrl: primaryRenderer.url })
+            ...(selectedTarget?.targetId === undefined ? {} : { primaryRendererTargetId: selectedTarget.targetId }),
+            ...(selectedTarget?.url === undefined ? {} : { primaryRendererUrl: selectedTarget.url }),
+            selectionRationale
           };
         } catch {
           return {
-            targets: []
+            targets: [],
+            selectionRationale: "target discovery failed"
           };
         }
       })();
@@ -694,6 +756,9 @@ export class PlaywrightElectronDriver implements ElectronDriver {
           cdpEndpoint: endpoint,
           primaryWindowId: primaryWindow?.id,
           attachTargetCount: cdpTargets.targets.length,
+          attachTargets: cdpTargets.targets,
+          attachSelectionRationale: cdpTargets.selectionRationale,
+          ...(cdpTargets.primaryRendererUrl === undefined ? {} : { primaryRendererUrl: cdpTargets.primaryRendererUrl }),
           ...(cdpTargets.primaryRendererTargetId === undefined
             ? {}
             : {
@@ -713,6 +778,62 @@ export class PlaywrightElectronDriver implements ElectronDriver {
   public async getWindows(session: DriverSession): Promise<DriverWindow[]> {
     const runtime = this.requireRuntime(session);
     return this.refreshWindows(runtime);
+  }
+
+  public async startTracing(session: DriverSession, options?: DriverTraceOptions): Promise<void> {
+    const runtime = this.requireRuntime(session);
+    if (runtime.tracingActive) {
+      throw toDriverError("INVALID_INPUT", `Tracing is already active for session "${session.id}".`, false, {
+        sessionId: session.id
+      });
+    }
+
+    const context = this.requireTracingContext(runtime);
+    const screenshots = options?.screenshots ?? true;
+    const snapshots = options?.snapshots ?? true;
+
+    try {
+      await context.tracing.start({
+        screenshots,
+        snapshots
+      });
+      runtime.tracingActive = true;
+    } catch (error: unknown) {
+      throw toDriverError("INTERNAL_ERROR", `Failed to start tracing for session "${session.id}".`, true, {
+        sessionId: session.id,
+        screenshots,
+        snapshots,
+        cause: asErrorMessage(error)
+      });
+    }
+  }
+
+  public async stopTracing(session: DriverSession, savePath: string): Promise<void> {
+    const runtime = this.requireRuntime(session);
+    if (savePath.trim().length === 0) {
+      throw toDriverError("INVALID_INPUT", "Trace savePath must be a non-empty path.", false, {
+        sessionId: session.id
+      });
+    }
+
+    if (!runtime.tracingActive) {
+      throw toDriverError("INVALID_INPUT", `Tracing is not active for session "${session.id}".`, false, {
+        sessionId: session.id
+      });
+    }
+
+    const context = this.requireTracingContext(runtime);
+
+    try {
+      await context.tracing.stop({ path: savePath });
+      runtime.tracingActive = false;
+    } catch (error: unknown) {
+      throw toDriverError("INTERNAL_ERROR", `Failed to stop tracing for session "${session.id}".`, true, {
+        sessionId: session.id,
+        savePath,
+        cause: asErrorMessage(error)
+      });
+    }
   }
 
   public async getSnapshot(driverWindow: DriverWindow, options?: Record<string, unknown>): Promise<RawSnapshot> {
@@ -980,6 +1101,30 @@ export class PlaywrightElectronDriver implements ElectronDriver {
     }
   }
 
+  public async focusWindow(session: DriverSession, windowId: string): Promise<void> {
+    const runtime = this.requireRuntime(session);
+    const page = runtime.windowsById.get(windowId);
+    if (page === undefined || page.isClosed()) {
+      throw toDriverError("WINDOW_NOT_FOUND", `Window "${windowId}" is not available in this session.`, false, {
+        sessionId: session.id,
+        windowId
+      });
+    }
+
+    try {
+      await page.bringToFront();
+      await page.evaluate(() => {
+        globalThis.focus?.();
+      });
+    } catch (error: unknown) {
+      throw toDriverError("INTERNAL_ERROR", `Failed to focus window "${windowId}".`, true, {
+        sessionId: session.id,
+        windowId,
+        cause: asErrorMessage(error)
+      });
+    }
+  }
+
   public async getConsoleLogs(session: DriverSession, options?: ConsoleLogOptions): Promise<ConsoleEntry[]> {
     const runtime = this.requireRuntime(session);
     const threshold = options?.level ?? "trace";
@@ -992,10 +1137,38 @@ export class PlaywrightElectronDriver implements ElectronDriver {
     return filtered.slice(-limit);
   }
 
+  public async getNetworkLogs(session: DriverSession, options?: NetworkLogOptions): Promise<NetworkEntry[]> {
+    const runtime = this.requireRuntime(session);
+    const limit = toNumberOption(options?.limit, DEFAULT_NETWORK_LIMIT);
+    const filteredEntries =
+      options?.windowId === undefined
+        ? runtime.networkEntries
+        : runtime.networkEntries.filter((entry) => entry.windowId === options.windowId);
+
+    return filteredEntries.slice(-limit).map((entry) => ({
+      url: entry.url,
+      method: entry.method,
+      status: entry.status,
+      mimeType: entry.mimeType,
+      timestamp: entry.timestamp
+    }));
+  }
+
   public async close(session: DriverSession): Promise<void> {
     const runtime = this.runtimes.get(session.id);
     if (runtime === undefined) {
       return;
+    }
+
+    if (runtime.tracingActive) {
+      try {
+        const tracingContext = this.requireTracingContext(runtime);
+        await tracingContext.tracing.stop();
+      } catch {
+        // Best-effort stop during close; explicit trace_stop should be used to persist traces.
+      } finally {
+        runtime.tracingActive = false;
+      }
     }
 
     const closeAttempts = [
@@ -1072,10 +1245,12 @@ export class PlaywrightElectronDriver implements ElectronDriver {
       pageIds: new WeakMap<Page, string>(),
       refDescriptorsByWindowId: new Map<string, Map<string, SnapshotRefDescriptor>>(),
       consoleEntries: [],
+      networkEntries: [],
       teardownCallbacks: [...config.teardownCallbacks],
       windowSequence: {
         value: 0
       },
+      tracingActive: false,
       recentStdout: config.recentStdout,
       recentStderr: config.recentStderr
     };
@@ -1094,6 +1269,29 @@ export class PlaywrightElectronDriver implements ElectronDriver {
     }
 
     return runtime;
+  }
+
+  private requireTracingContext(runtime: DriverRuntime): BrowserContext {
+    if (runtime.electronApp !== undefined) {
+      return runtime.electronApp.context();
+    }
+
+    if (runtime.browser !== undefined) {
+      const contexts = runtime.browser.contexts();
+      const context = contexts[0];
+      if (context !== undefined) {
+        return context;
+      }
+    }
+
+    throw toDriverError(
+      "SESSION_NOT_FOUND",
+      `No browser context is available for session "${runtime.sessionId}".`,
+      false,
+      {
+        sessionId: runtime.sessionId
+      }
+    );
   }
 
   private requireRuntimeForWindow(windowId: string): DriverRuntime {
@@ -1136,6 +1334,7 @@ export class PlaywrightElectronDriver implements ElectronDriver {
     const context = runtime.electronApp.context();
     const bindPage = (page: Page): void => {
       this.attachConsoleListener(runtime, page);
+      this.attachNetworkListener(runtime, page);
       this.ensurePageId(runtime, page);
     };
 
@@ -1162,6 +1361,7 @@ export class PlaywrightElectronDriver implements ElectronDriver {
     for (const context of contexts) {
       const bindPage = (page: Page): void => {
         this.attachConsoleListener(runtime, page);
+        this.attachNetworkListener(runtime, page);
         this.ensurePageId(runtime, page);
       };
 
@@ -1198,6 +1398,72 @@ export class PlaywrightElectronDriver implements ElectronDriver {
     page.on("console", onConsole);
     runtime.teardownCallbacks.push(() => {
       page.off("console", onConsole);
+    });
+  }
+
+  private attachNetworkListener(runtime: DriverRuntime, page: Page): void {
+    const pageId = this.ensurePageId(runtime, page);
+    const pushEntry = (entry: Omit<RuntimeNetworkEntry, "windowId">): void => {
+      runtime.networkEntries.push({
+        windowId: pageId,
+        ...entry
+      });
+
+      if (runtime.networkEntries.length > NETWORK_BUFFER_LIMIT) {
+        runtime.networkEntries.splice(0, runtime.networkEntries.length - NETWORK_BUFFER_LIMIT);
+      }
+    };
+
+    const onRequestFinished = (request: any): void => {
+      const response =
+        request !== null && typeof request === "object" && typeof request.response === "function"
+          ? request.response()
+          : null;
+      const status =
+        response !== null && typeof response === "object" && typeof response.status === "function"
+          ? response.status()
+          : 0;
+      const headers =
+        response !== null && typeof response === "object" && typeof response.headers === "function"
+          ? (response.headers() as Record<string, string>)
+          : undefined;
+
+      pushEntry({
+        url:
+          request !== null && typeof request === "object" && typeof request.url === "function"
+            ? request.url()
+            : "unknown",
+        method:
+          request !== null && typeof request === "object" && typeof request.method === "function"
+            ? request.method()
+            : "GET",
+        status,
+        mimeType: extractMimeType(headers),
+        timestamp: new Date().toISOString()
+      });
+    };
+
+    const onRequestFailed = (request: any): void => {
+      pushEntry({
+        url:
+          request !== null && typeof request === "object" && typeof request.url === "function"
+            ? request.url()
+            : "unknown",
+        method:
+          request !== null && typeof request === "object" && typeof request.method === "function"
+            ? request.method()
+            : "GET",
+        status: 0,
+        mimeType: "unknown",
+        timestamp: new Date().toISOString()
+      });
+    };
+
+    page.on("requestfinished", onRequestFinished);
+    page.on("requestfailed", onRequestFailed);
+    runtime.teardownCallbacks.push(() => {
+      page.off("requestfinished", onRequestFinished);
+      page.off("requestfailed", onRequestFailed);
     });
   }
 
