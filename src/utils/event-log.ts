@@ -26,13 +26,25 @@ const shouldRedactKey = (key: string): boolean => {
   return REDACT_KEYS.some((candidate) => loweredKey.includes(candidate));
 };
 
-const redactValue = (value: unknown, depth: number): unknown => {
+const redactString = (value: string, redactionPatterns: readonly RegExp[]): string => {
+  let redactedValue = value;
+  for (const pattern of redactionPatterns) {
+    redactedValue = redactedValue.replace(pattern, REDACTED);
+  }
+  return redactedValue;
+};
+
+const redactValue = (value: unknown, depth: number, redactionPatterns: readonly RegExp[]): unknown => {
   if (depth > 6) {
     return "[TRUNCATED]";
   }
 
+  if (typeof value === "string") {
+    return redactString(value, redactionPatterns);
+  }
+
   if (Array.isArray(value)) {
-    return value.map((entry) => redactValue(entry, depth + 1));
+    return value.map((entry) => redactValue(entry, depth + 1, redactionPatterns));
   }
 
   if (!isRecord(value)) {
@@ -44,7 +56,7 @@ const redactValue = (value: unknown, depth: number): unknown => {
       return [key, REDACTED] as const;
     }
 
-    return [key, redactValue(entryValue, depth + 1)] as const;
+    return [key, redactValue(entryValue, depth + 1, redactionPatterns)] as const;
   });
 
   return Object.fromEntries(redactedEntries);
@@ -79,17 +91,33 @@ export interface EventLogRecordInput {
 export class EventLog {
   private readonly maxEntries: number;
   private readonly events: ToolInvocationEvent[];
+  private readonly redactionPatterns: RegExp[];
+  private readonly redactionPatternKeys: Set<string>;
 
   public constructor(maxEntries: number = DEFAULT_MAX_ENTRIES) {
     this.maxEntries = maxEntries;
     this.events = [];
+    this.redactionPatterns = [];
+    this.redactionPatternKeys = new Set();
+  }
+
+  public addRedactionPatterns(patterns: readonly string[]): void {
+    for (const pattern of patterns) {
+      const normalizedPattern = pattern.trim();
+      if (normalizedPattern.length === 0 || this.redactionPatternKeys.has(normalizedPattern)) {
+        continue;
+      }
+
+      this.redactionPatterns.push(new RegExp(normalizedPattern, "g"));
+      this.redactionPatternKeys.add(normalizedPattern);
+    }
   }
 
   public record(input: EventLogRecordInput): ToolInvocationEvent {
     const baseEvent = {
       timestamp: input.timestamp ?? new Date().toISOString(),
       toolName: input.toolName,
-      params: redactValue(input.params, 0),
+      params: redactValue(input.params, 0, this.redactionPatterns),
       resultSummary: input.resultSummary,
       durationMs: input.durationMs
     };

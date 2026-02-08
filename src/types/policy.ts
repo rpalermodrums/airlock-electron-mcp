@@ -9,6 +9,37 @@ export interface SafetyPolicy {
   maxSessionTtlMs: number;
 }
 
+export interface PolicyToolSelection {
+  disabled?: readonly string[];
+  requireConfirmation?: readonly string[];
+}
+
+export interface PolicyFile {
+  version: 1;
+  mode?: SafetyMode;
+  roots?: readonly string[];
+  allowedEnvVars?: readonly string[];
+  allowedOrigins?: readonly string[];
+  tools?: PolicyToolSelection;
+  maxSessionTTLMs?: number;
+  maxSnapshotNodes?: number;
+  redactionPatterns?: readonly string[];
+}
+
+export interface ResolvedToolPolicy {
+  disabled: readonly string[];
+  requireConfirmation: readonly string[];
+}
+
+export interface ResolvedPolicy extends SafetyPolicy {
+  roots?: readonly string[];
+  allowedEnvVars?: readonly string[];
+  tools?: ResolvedToolPolicy;
+  maxSnapshotNodes?: number;
+  redactionPatterns?: readonly string[];
+  sourcePath?: string;
+}
+
 export interface ModeCapabilities {
   allowAppKill: boolean;
   allowTrustedEval: boolean;
