@@ -2,7 +2,7 @@
 
 Airlock is a local-first MCP server that lets coding agents drive Electron apps with a browser-style loop: snapshot UI state, take action, validate, and collect artifacts.
 
-It is built for real development workflows, not toy demos:
+It is built for real development workflows:
 
 - 35 MCP tools across launch, windowing, snapshots, actions, waits, diagnostics, and safety controls.
 - Playwright-backed Electron automation with both launch and CDP attach paths.
